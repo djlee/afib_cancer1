@@ -1,0 +1,1614 @@
+# Afib - cancer proteomic analysis using prevalence and 41270 field
+# AFib as control, cancer as cases
+
+---
+title: "Cancer-prevalent AFib as Controls Proteomics"
+output: html_document
+date: "`r Sys.Date()`"
+---
+### Load in libraries
+```{r}
+library(readr)
+library(dplyr)
+library(data.table)
+library(ukbtools)
+library(purrr)
+library(janitor)
+library(tidyr)
+library(ggplot2)
+library(survival)
+library(broom)
+library(purrr)
+library(ggrepel)
+library(ggbreak)
+library(gridExtra)
+library(grid)
+library(R.utils)
+library(TwoSampleMR)
+library(genetics.binaRies)
+library(ieugwasr)
+library(stringr)
+library(jsonlite)
+library(forcats)
+
+```
+
+### Load in proteins file, covariates and data dict
+```{r}
+olink_df <- read_tsv("/mnt/project/Proteomics/olink_npx_clean_imputed.tsv")
+covariates_named <- read_tsv("/mnt/project/Proteomics/covariates_named.tsv")
+dict <- read_csv("/mnt/project/Proteomics/raw/ddd/proteomics_baseline.data_dictionary.csv")
+
+```
+### Let's combine the proteomics and covariates datasets
+
+```{r}
+merged_df <- inner_join(olink_df, covariates_named, by = "eid")
+
+```
+
+### Exclude relatives
+```{r}
+
+rel_path <- "/mnt/project/Bulk/Genotype Results/Genotype calls/ukb_rel.dat"  # update to actual path if needed
+kin_df <- data.table::fread(rel_path)
+
+#Get vector of our IDs
+eid_vec <- merged_df$eid
+
+set.seed(1)
+to_remove <- ukb_gen_samples_to_remove(kin_df, ukb_with_data = eid_vec, cutoff = 0.0884)
+
+
+#Filter
+merged_df <- merged_df %>%
+  filter(!eid %in% to_remove)
+
+dim(merged_df)
+```
+
+### Get the relevant fields using data field 41270 for ICD
+```{r}
+field_list <- c("participant.eid", "participant.p41270")
+writeLines(field_list, "~/afib/data/raw/icd10_field_list_41270.txt")
+```
+
+### Extract the fields from RAP
+```{r}
+field_list_file <- "~/afib/data/raw/icd10_field_list_41270.txt"
+output_file <- "~/afib/data/raw/icd10_diag_41270.tsv"
+
+cmd <- glue::glue(
+  "dx extract_dataset /Proteomics/proteomics_baseline ",
+  "--fields \"$(paste -sd, {field_list_file})\" ",
+  "--delimiter '\\t' ",
+  "--output {output_file}"
+)
+
+system(cmd)
+
+```
+
+
+### Load metadata
+
+```{r}
+# Load extracted ICD-10 data
+icd_df <- read_tsv("~/afib/data/raw/icd10_diag_41270.tsv")
+
+# Parse and unnest ICD codes
+icd_long <- icd_df %>%
+  filter(!is.na(participant.p41270), participant.p41270 != "") %>%
+  mutate(icd_list = map(participant.p41270, ~ fromJSON(.) %>% as.character())) %>%
+  select(participant.eid, icd_list) %>%
+  unnest(icd_list) %>%
+  rename(icd10_code = icd_list)
+```
+
+### AF metadata
+
+```{r}
+afib_metadata <- icd_long %>%
+  filter(str_detect(icd10_code, "^I48")) %>%
+  distinct(eid = participant.eid) %>%
+  mutate(afib_status = 1)
+```
+
+
+### Cancer metadata
+
+```{r}
+# Load map of defined cancer groupings
+defined_cancer_map <- tribble(
+  ~icd_prefix, ~defined_group,
+  "C18", "colorectal",
+  "C19", "colorectal",
+  "C20", "colorectal",
+  "C50", "breast",
+  "C61", "prostate",
+  "C34", "lung",
+  "C22", "liver",
+  "C64", "kidney",
+  "C73", "thyroid",
+  "C67", "bladder",
+  "C56", "ovary",
+  "C54", "uterus",
+  "C71", "brain",
+  "C25", "pancreas",
+  "C15", "esophagus",
+  "C81", "hodgkin",
+  "C82", "nhl",
+  "C83", "nhl",
+  "C85", "nhl",
+  "C90", "myeloma",
+  "C91", "leukemia",
+  "C92", "leukemia",
+  "C94", "leukemia"
+)
+
+# Step 2a: Filter cancer ICDs and annotate
+cancer_icd_annotated <- icd_long %>%
+  filter(str_detect(icd10_code, "^C[0-9]{2}")) %>%
+  distinct(participant.eid, icd10_code) %>%
+  mutate(icd_prefix = substr(icd10_code, 1, 3)) %>%
+  left_join(defined_cancer_map, by = "icd_prefix") %>%
+  mutate(defined_group = coalesce(defined_group, "other"))
+
+# Step 2b: Create one-row-per-person metadata
+cancer_metadata <- cancer_icd_annotated %>%
+  group_by(participant.eid) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(cancer_status = 1) %>%
+  select(eid = participant.eid, cancer_status, icd_group = defined_group, cancer_icd = icd10_code)
+```
+
+### Combine
+
+```{r}
+working_df <- merged_df %>%
+  left_join(afib_metadata, by = "eid") %>%
+  left_join(cancer_metadata, by = "eid") %>%
+  mutate(
+    afib_status = replace_na(afib_status, 0),
+    cancer_status = replace_na(cancer_status, 0),
+    icd_group = replace_na(icd_group, "no_cancer"),
+    cancer_icd = replace_na(cancer_icd, "None")
+  )
+
+working_df %>%
+  count(afib_status, cancer_status) %>%
+  mutate(label = case_when(
+    afib_status == 1 & cancer_status == 1 ~ "AFib + Cancer",
+    afib_status == 1 & cancer_status == 0 ~ "AFib only",
+    afib_status == 0 & cancer_status == 1 ~ "Cancer only",
+    TRUE ~ "Neither"
+  )) %>%
+  select(label, n) %>%
+  arrange(desc(n)) %>%
+  knitr::kable(caption = "Final Cohort Breakdown")
+
+```
+### Summarize
+```{r}
+icd_summary <- working_df %>%
+  filter(cancer_status == 1) %>%  # only participants with cancer
+  group_by(icd_group) %>%
+  summarise(
+    Total = n(),
+    AFib = sum(afib_status == 1),
+    AFib_Rate = round(AFib / Total, 3),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Total))
+
+
+knitr::kable(
+  icd_summary,
+  caption = "AFib Counts and Rates Within Each Cancer Group",
+  col.names = c("Cancer Group", "Total with Cancer", "AFib Cases", "AFib Rate")
+)
+
+cancer_status_summary <- working_df %>%
+  count(cancer_status) %>%
+  mutate(
+    cancer_status = if_else(cancer_status == 1, "Cancer", "No Cancer")
+  )
+
+knitr::kable(
+  cancer_status_summary,
+  caption = "Total Participants by Cancer Status",
+  col.names = c("Cancer Status", "n")
+)
+
+```
+
+### Impute missing covariates
+
+```{r}
+# covariates to work off of
+covariates <- c("bmi", "townsend_index", "alcohol_status", 
+                "sbp_1", "dbp_1", 
+                "total_cholesterol", "ldl_cholesterol", "hdl_cholesterol", 
+                "triglycerides", "creatinine")
+
+working_df <- working_df %>%
+  mutate(across(all_of(covariates),
+                .fns = ~ as.integer(is.na(.)),
+                .names = "{.col}_missing"))
+
+###  Step 2: Fit linear models to predict missing values ####
+
+predictors <- c("sex", "age", "ethnicity", paste0("PC", 1:10))
+
+lm_models <- map(covariates, function(var) {
+  formula <- as.formula(paste(var, "~", paste(predictors, collapse = " + ")))
+  lm(formula, data = working_df)
+})
+names(lm_models) <- covariates
+
+
+###  Step 3: Generate predictions ####
+predictions <- map2_dfc(
+  covariates, lm_models,
+  ~ tibble(!!paste0(.x, "_predicted") := predict(.y, newdata = working_df))
+)
+
+working_df <- bind_cols(working_df, predictions)
+
+
+###  Step 4: Impute missing values with predicted ####
+for (var in covariates) {
+  working_df[[paste0(var, "_final")]] <- ifelse(
+    is.na(working_df[[var]]),
+    working_df[[paste0(var, "_predicted")]],
+    working_df[[var]]
+  )
+}
+
+###  Missingness summary before impu````````````````````````````tation ####
+
+missing_summary <- working_df %>%
+  select(all_of(covariates)) %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "PercentMissing") %>%
+  arrange(desc(PercentMissing))
+
+knitr::kable(missing_summary, digits = 2, caption = "Percent Missingness Before Imputation")
+
+ggplot(missing_summary, aes(x = reorder(Variable, PercentMissing), y = PercentMissing)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Covariate Missingness", x = "", y = "% Missing")
+
+write_csv(missing_summary, "~/afib/outputs/proteomics/covariate_missingness_summary.csv")
+
+```
+
+### Let's save the data now
+
+```{r}
+###  Save final cleaned + imputed dataset ####
+
+output_path <- "~/afib/data/processed/ukb_proteomics_afib_cleaned.tsv"
+
+# Write the final table as tab-delimited without row names or quotes
+write.table(working_df, file = output_path, sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+```
+
+### Quick metadata
+
+```{r}
+###  Quick metadata for table 2 ####
+
+table2_df <- working_df %>%
+  mutate(
+    study_group = case_when(
+      afib_status == 1 & cancer_status == 0 ~ "AF-Only",
+      afib_status == 1 & cancer_status == 1 ~ "AF+PanCancer",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(study_group))
+
+# Add AF+Lung and AF+NHL as separate groups
+# (these participants also appear in AF+PanCancer, which is fine — they're not mutually exclusive)
+lung_df <- working_df %>%
+  filter(afib_status == 1, icd_group == "lung") %>%
+  mutate(study_group = "AF+Lung")
+
+nhl_df <- working_df %>%
+  filter(afib_status == 1, icd_group == "nhl") %>%
+  mutate(study_group = "AF+NHL")
+
+table2_df <- bind_rows(table2_df, lung_df, nhl_df)
+
+# Now summarize
+table2_summary <- table2_df %>%
+  mutate(
+    male = as.integer(sex == 1),
+    white = as.integer(ethnicity %in% c(1, 1001, 1002, 1003))
+  ) %>%
+  group_by(study_group) %>%
+  summarise(
+    n = n(),
+    age_mean = round(mean(age, na.rm = TRUE), 1),
+    age_sd = round(sd(age, na.rm = TRUE), 1),
+    male_n = sum(male, na.rm = TRUE),
+    male_pct = round(100 * mean(male, na.rm = TRUE), 1),
+    white_n = sum(white, na.rm = TRUE),
+    white_pct = round(100 * mean(white, na.rm = TRUE), 1),
+    bmi_mean = round(mean(bmi, na.rm = TRUE), 1),
+    bmi_sd = round(sd(bmi, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+print(table2_summary)
+
+```
+
+### Logistic regression for composite cancer
+
+```{r}
+
+# Define covariates and collapse into string
+covariates <- c("age", "sex", paste0("PC", 1:10), "ethnicity")
+cov_str <- paste(covariates, collapse = " + ")
+
+# Define proteins
+protein_vars <- setdiff(names(olink_df), "eid")
+
+# Subset to AFib participants only
+afib_df <- working_df %>%
+  filter(afib_status == 1)
+
+# Container
+all_logit_results <- list()
+
+# Loop through all proteins
+logit_results <- map_dfr(protein_vars, function(prot) {
+  formula_str <- paste0("cancer_status ~ ", prot, " + ", cov_str)
+  
+  tryCatch({
+    fit <- glm(as.formula(formula_str), data = afib_df, family = binomial)
+    tidy(fit) %>%
+      filter(term == prot) %>%
+      mutate(protein = prot)
+  }, error = function(e) NULL)
+})
+
+# Format
+logit_results_clean <- logit_results %>%
+  select(term, estimate, std.error, statistic, p.value, protein) %>%
+  rename(
+    Log_OR = estimate,
+    SE = std.error,
+    Z = statistic,
+    P = p.value
+  ) %>%
+  mutate(
+    OR = exp(Log_OR),
+    CI_Lower = exp(Log_OR - 1.96 * SE),
+    CI_Upper = exp(Log_OR + 1.96 * SE),
+    Group = "PanCancer",
+    P_adj = p.adjust(P, method = "fdr")
+  )
+
+# Save
+write_csv(logit_results_clean, "~/afib/outputs/proteomics/afib_cancer/afib_control/logit_pancancer.csv")
+
+# Visualization
+sample_n <- working_df %>%
+  filter(afib_status == 1) %>%
+  count(cancer_status) %>%
+  mutate(label = if_else(cancer_status == 1, "AFib + Cancer", "AFib Only")) %>%
+  select(label, n)
+
+# Convert to named values
+n_cancer <- sample_n$n[sample_n$label == "AFib + Cancer"]
+n_afib_only <- sample_n$n[sample_n$label == "AFib Only"]
+
+# Prepare volcano dataframe
+volcano_df <- logit_results_clean %>%
+  mutate(
+    neg_log_p = -log10(P_adj),
+    direction = case_when(
+      P_adj >= 0.05 ~ "Neutral",
+      Log_OR > 0 ~ "Up (Risk ↑)",
+      Log_OR < 0 ~ "Down (Protective)"
+    ),
+    label = ifelse(P_adj < 0.05 & abs(Log_OR) > 0.25, protein, NA)  # customize threshold here
+  )
+
+# Plot
+ggplot(volcano_df, aes(x = Log_OR, y = neg_log_p, color = direction)) +
+  geom_point(alpha = 0.9, size = 1.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkred") +
+  geom_text_repel(aes(label = label), size = 4, max.overlaps = 25) +
+  scale_color_manual(
+    values = c(
+      "Up (Risk ↑)" = "#D55E00",
+      "Down (Protective)" = "#0072B2",
+      "Neutral" = "grey70"
+    )
+  ) +
+  labs(
+  title = "Proteins Associated with Pan-Cancer in AFib-Only Patients",
+  subtitle = paste0("AFib + Cancer (n = ", n_cancer, "), AFib Only (n = ", n_afib_only, ")"),
+  x = "log(Odds Ratio)",
+  y = expression(-log[10]~"(FDR-Adjusted P-Value)"),
+  color = "Direction"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  coord_cartesian(ylim = c(0, 20))  # adjust as needed
+
+
+# Prepare volcano dataframe with adjusted pval
+volcano_df <- logit_results_clean %>%
+  mutate(
+    neg_log_p = -log10(P_adj),
+    direction = case_when(
+      P_adj >= 0.1 ~ "Neutral",
+      Log_OR > 0 ~ "Up (Risk ↑)",
+      Log_OR < 0 ~ "Down (Protective)"
+    ),
+    label = ifelse(P_adj < 0.1, protein, NA)  # threshold adjusted here too
+  )
+
+# Plot
+ggplot(volcano_df, aes(x = Log_OR, y = neg_log_p, color = direction)) +
+  geom_point(alpha = 0.9, size = 1.5) +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed", color = "darkred") +
+  geom_text_repel(aes(label = label), size = 4, max.overlaps = 25) +
+  scale_color_manual(
+    values = c(
+      "Up (Risk ↑)" = "#D55E00",
+      "Down (Protective)" = "#0072B2",
+      "Neutral" = "grey70"
+    )
+  ) +
+  labs(
+  title = "Proteins Associated with Pan-Cancer in AFib-Only Patients",
+  subtitle = paste0("AFib + Cancer (n = ", n_cancer, "), AFib Only (n = ", n_afib_only, ")"),
+  x = "log(Odds Ratio)",
+  y = expression(-log[10]~"(FDR-Adjusted P-Value)"),
+  color = "Direction"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  coord_cartesian(ylim = c(0, 2))  # adjust as needed
+
+
+```
+
+### ok, loop thru diff cancers now
+
+```{r}
+#cancers of interest
+cancers <- c("prostate", "breast", "colorectal", "lung", "bladder", "esophagus", "nhl")
+
+covariates <- c("age", "sex", paste0("PC", 1:10), "ethnicity")
+cov_str <- paste(covariates, collapse = " + ")
+protein_vars <- setdiff(names(olink_df), "eid")
+
+
+# Filter to only AFib patients
+afib_df <- working_df %>%
+  filter(afib_status == 1)
+
+# Container
+all_results <- list()
+
+for (cancer in cancers) {
+  message("Analyzing cancer group: ", cancer)
+  
+  # Create binary outcome: 1 = AFib + specific cancer, 0 = AFib-only (no cancer)
+  group_df <- afib_df %>%
+    mutate(case = if_else(icd_group == cancer, 1, 0)) %>%
+    filter(case == 1 | cancer_status == 0)  # Keep only AFib-only or AFib + this cancer
+  
+  # Skip if not enough cancer cases
+  n_cancer <- sum(group_df$case == 1)
+  if (n_cancer < 10) {
+    message("  Skipping ", cancer, ": only ", n_cancer, " cancer cases.")
+    next
+  }
+
+  # Run regression for each protein
+  group_results <- map_dfr(protein_vars, function(prot) {
+    formula_str <- paste0("case ~ ", prot, " + ", cov_str)
+    tryCatch({
+      fit <- glm(as.formula(formula_str), data = group_df, family = binomial)
+      tidy(fit) %>%
+        filter(term == prot) %>%
+        mutate(protein = prot)
+    }, error = function(e) NULL)
+  })
+
+  # Format results
+  group_results_clean <- group_results %>%
+    select(term, estimate, std.error, statistic, p.value, protein) %>%
+    rename(
+      Log_OR = estimate,
+      SE = std.error,
+      Z = statistic,
+      P = p.value
+    ) %>%
+    mutate(
+      OR = exp(Log_OR),
+      CI_Lower = exp(Log_OR - 1.96 * SE),
+      CI_Upper = exp(Log_OR + 1.96 * SE),
+      Group = cancer,
+      P_adj = p.adjust(P, method = "fdr")
+    )
+
+  # Save
+  all_results[[cancer]] <- group_results_clean
+  write_csv(group_results_clean, paste0("~/afib/outputs/proteomics/afib_cancer/afib_control/logit_", cancer, ".csv"))
+}
+
+# Combine all
+combined_afibonly_results <- bind_rows(all_results)
+write_csv(combined_afibonly_results, "~/afib/outputs/proteomics/afib_cancer/afib_control/logit_combined.csv")
+combined_afibonly_results <- read_csv("~/afib/outputs/proteomics/afib_cancer/afib_control/logit_combined.csv")
+
+# Get unique cancer groups
+groups <- unique(combined_afibonly_results$Group)
+
+# Get sample sizes
+sample_n_df <- working_df %>%
+  filter(afib_status == 1) %>%
+  mutate(group = if_else(icd_group %in% groups, icd_group, "afib_only")) %>%
+  group_by(group) %>%
+  summarise(n = n(), .groups = "drop")
+
+pdf("~/afib/outputs/proteomics/afib_cancer/afib_control/volcano_plots_all.pdf",
+    width = 7, height = 5)
+
+# Loop through and plot
+for (grp in groups) {
+  message("Plotting: ", grp)
+  
+  n_total <- sample_n_df$n[sample_n_df$group == grp]
+  n_afib_only <- sample_n_df$n[sample_n_df$group == "afib_only"]
+  
+  volcano_df <- combined_afibonly_results %>%
+    filter(Group == grp) %>%
+    mutate(
+      neg_log_p = -log10(P_adj),
+      direction = case_when(
+        P_adj >= 0.05 ~ "Neutral",
+        Log_OR > 0 ~ "Positive Assocation (OR > 1)",
+        Log_OR < 0 ~ "Negative Assocation (OR < 1)"
+      ),
+      label = ifelse(P_adj < 0.05 & abs(Log_OR) > 0.25, protein, NA)
+    )
+  
+  # Plot
+  p <- ggplot(volcano_df, aes(x = Log_OR, y = neg_log_p, color = direction)) +
+    geom_point(alpha = 0.9, size = 1.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkred") +
+    geom_text_repel(aes(label = label), size = 4, max.overlaps = 25) +
+    scale_color_manual(
+      values = c(
+         "Positive Assocation (OR > 1)" = "#D55E00",
+         "Negative Assocation (OR < 1)" = "#0072B2",
+        "Neutral" = "grey70"
+      )
+    ) +
+    labs(
+    title = paste("AFib +", grp, "vs AFib Only"),
+    subtitle = paste0("n = ", n_total, " with ", grp, ", n = ", n_afib_only, " AFib-only"),
+    x = "log(Odds Ratio)",
+    y = expression(-log[10]~"(FDR-Adjusted P-Value)"),
+    color = "Direction"
+     ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    coord_cartesian(ylim = c(0, 20))  # Adjust as needed
+  
+  print(p)
+}
+  
+dev.off()
+
+```
+### Ok, cancer control
+```{r}
+covariates <- c("age", "sex", paste0("PC", 1:10), "ethnicity")
+cov_str <- paste(covariates, collapse = " + ")
+
+# 7 selected groups (from your cleaned icd_group column)
+cancer_groups <- c("prostate", "breast", "colorectal", "lung", "bladder", "esophagus", "nhl")
+
+# Protein variables
+protein_vars <- setdiff(names(olink_df), "eid")
+cov_str <- paste(c("age", "sex", paste0("PC", 1:10), "ethnicity"), collapse = " + ")
+
+# Store results
+all_results <- list()
+
+# First: Pan-cancer (all cancer patients)
+message("Running pan-cancer AFib model")
+
+cancer_df <- working_df %>% filter(cancer_status == 1)
+
+pan_results <- map_dfr(protein_vars, function(prot) {
+  formula_str <- paste0("afib_status ~ ", prot, " + ", cov_str)
+  tryCatch({
+    fit <- glm(as.formula(formula_str), data = cancer_df, family = binomial)
+    tidy(fit) %>%
+      filter(term == prot) %>%
+      mutate(protein = prot)
+  }, error = function(e) NULL)
+})
+
+
+pan_clean <- pan_results %>%
+  select(term, estimate, std.error, statistic, p.value, protein) %>%
+  rename(Log_OR = estimate, SE = std.error, Z = statistic, P = p.value) %>%
+  mutate(
+    OR = exp(Log_OR),
+    CI_Lower = exp(Log_OR - 1.96 * SE),
+    CI_Upper = exp(Log_OR + 1.96 * SE),
+    Group = "pan_cancer",
+    P_adj = p.adjust(P, method = "fdr")
+  )
+
+all_results[["pan_cancer"]] <- pan_clean
+write_csv(pan_clean, "~/afib/outputs/proteomics/afib_cancer/cancer_control/logit_pancancer.csv")
+
+
+# Now loop through each cancer group
+for (group in cancer_groups) {
+  message("Analyzing cancer group: ", group)
+  
+  group_df <- working_df %>%
+    filter(icd_group == group)
+  
+  n_afib <- sum(group_df$afib_status == 1)
+  if (n_afib < 10) {
+    message("  Skipping due to insufficient AFib cases (n = ", n_afib, ")")
+    next
+  }
+
+  group_results <- map_dfr(protein_vars, function(prot) {
+    formula_str <- paste0("afib_status ~ ", prot, " + ", cov_str)
+    tryCatch({
+      fit <- glm(as.formula(formula_str), data = group_df, family = binomial)
+      tidy(fit) %>%
+        filter(term == prot) %>%
+        mutate(protein = prot)
+    }, error = function(e) NULL)
+  })
+
+  group_clean <- group_results %>%
+    select(term, estimate, std.error, statistic, p.value, protein) %>%
+    rename(Log_OR = estimate, SE = std.error, Z = statistic, P = p.value) %>%
+    mutate(
+      OR = exp(Log_OR),
+      CI_Lower = exp(Log_OR - 1.96 * SE),
+      CI_Upper = exp(Log_OR + 1.96 * SE),
+      Group = group,
+      P_adj = p.adjust(P, method = "fdr")
+    )
+
+  all_results[[group]] <- group_clean
+  write_csv(group_clean, paste0("~/afib/outputs/proteomics/afib_cancer/cancer_control/logit_", group, ".csv"))
+}
+
+# Combine all results
+combined_results <- bind_rows(all_results)
+write_csv(combined_results, "~/afib/outputs/proteomics/afib_cancer/cancer_control/logit_combined.csv")
+
+combined_cancercontrol_results <- read_csv("~/afib/outputs/proteomics/afib_cancer/cancer_control/logit_combined.csv")
+
+# Sample size table for each cancer group
+groups <- unique(combined_cancercontrol_results$Group)
+
+sample_n_df <- working_df %>%
+  filter(cancer_status == 1) %>%
+  group_by(group = icd_group, afib_status) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = afib_status, values_from = n, values_fill = 0) %>%
+  rename(n_no_afib = `0`, n_afib = `1`) %>%
+  bind_rows(
+    working_df %>%
+      filter(cancer_status == 1) %>%
+      summarise(n_no_afib = sum(afib_status == 0),
+                n_afib = sum(afib_status == 1)) %>%
+      mutate(group = "pan_cancer")
+  )
+
+plot_list <- list()
+
+for (i in seq_along(groups)) {
+  grp <- groups[i]
+  
+  n_afib <- sample_n_df$n_afib[sample_n_df$group == grp]
+  n_cancer_only <- sample_n_df$n_no_afib[sample_n_df$group == grp]
+  
+  volcano_df <- combined_cancercontrol_results %>%
+    filter(Group == grp) %>%
+    mutate(
+      neg_log_p = -log10(P_adj),
+      direction = case_when(
+        P_adj >= 0.05 ~ "Neutral",
+        Log_OR > 0 ~ "Positive Association (OR > 1)",
+        Log_OR < 0 ~ "Negative Association (OR < 1)"
+      ),
+      label = ifelse(P_adj < 0.05 & abs(Log_OR) > 0.25, protein, NA)
+    )
+  
+  p <- ggplot(volcano_df, aes(x = Log_OR, y = neg_log_p, color = direction)) +
+    geom_point(alpha = 0.9, size = 1.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkred") +
+    geom_text_repel(aes(label = label), size = 4, max.overlaps = 25) +
+    scale_color_manual(values = c(
+      "Positive Association (OR > 1)" = "#D55E00",
+      "Negative Association (OR < 1)" = "#0072B2",
+      "Neutral" = "grey70"
+    )) +
+    labs(
+      title = paste("AF +", grp, "vs", grp, "Only"),
+      subtitle = paste0("n = ", n_afib, " with AF, n = ", n_cancer_only, " cancer-only"),
+      x = "log(Odds Ratio)",
+      y = expression(-log[10]~"(FDR-Adjusted P-Value)"),
+      color = "Direction"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    coord_cartesian(ylim = c(0, 20))
+  
+  plot_list[[i]] <- p
+}
+
+pdf("~/afib/outputs/proteomics/afib_cancer/cancer_control/volcano_plots_all.pdf",
+    width = 7, height = 5)
+for (p in plot_list) {
+  print(p)
+}
+dev.off()
+
+
+```
+
+### Add in core afib proteins as PCs
+```{r}
+
+# Load in significant proteins
+cox_df <- read_csv("~/afib/outputs/proteomics/mono_afib/cox_results.csv")
+
+core_afib_proteins <- cox_df %>%
+  filter(P_adj < 0.05) %>%
+  arrange(P_adj) %>%
+  pull(Protein) %>%
+  unique()
+
+# Perform PCA on scaled matrix of core AFib proteins
+core_mat <- working_df %>%
+  select(all_of(core_afib_proteins)) %>%
+  scale()
+
+core_pcs <- prcomp(core_mat, center = TRUE, scale. = TRUE)
+
+# Add first 5 PCs to main dataframe
+df_pc <- working_df %>%
+  bind_cols(as_tibble(core_pcs$x[, 1:5]) %>% set_names(paste0("corePC", 1:5)))
+
+# Updated covariate list
+covariates <- c(
+  "age", "sex",
+  paste0("PC", 1:10),
+  "ethnicity",
+  paste0("corePC", 1:5)
+)
+cov_str <- paste(covariates, collapse = " + ")
+
+# Set protein variables
+protein_vars <- setdiff(names(olink_df), "eid")
+
+# Cancer groups to loop through
+cancer_groups <- c("pan_cancer", "prostate", "breast", "colorectal", "lung", "bladder", "esophagus", "nhl")
+
+# Container for results
+all_logit_results <- list()
+
+for (group in cancer_groups) {
+  message("Analyzing cancer group: ", group)
+  
+  # Filter for each cancer group
+  group_df <- if (group == "pan_cancer") {
+    df_pc %>% filter(cancer_status == 1)
+  } else {
+    df_pc %>% filter(icd_group == group)
+  }
+  
+  n_afib <- sum(group_df$afib_status == 1)
+  n_control <- sum(group_df$afib_status == 0)
+  
+  if (n_afib < 10 | n_control < 10) {
+    message("  Skipping due to small sample size (AFib = ", n_afib, ", Control = ", n_control, ")")
+    next
+  }
+  
+  # Loop through proteins
+  group_results <- map_dfr(protein_vars, function(prot) {
+    formula_str <- paste0("afib_status ~ ", prot, " + ", cov_str)
+    
+    tryCatch({
+      fit <- glm(as.formula(formula_str), data = group_df, family = binomial)
+      tidy(fit) %>%
+        filter(term == prot) %>%
+        mutate(protein = prot)
+    }, error = function(e) NULL)
+  })
+
+  # Format
+  if (nrow(group_results) > 0) {
+    group_results_clean <- group_results %>%
+      select(term, estimate, std.error, statistic, p.value, protein) %>%
+      rename(
+        Log_OR = estimate,
+        SE = std.error,
+        Z = statistic,
+        P = p.value
+      ) %>%
+      mutate(
+        OR = exp(Log_OR),
+        CI_Lower = exp(Log_OR - 1.96 * SE),
+        CI_Upper = exp(Log_OR + 1.96 * SE),
+        Group = group,
+        P_adj = p.adjust(P, method = "fdr")
+      )
+    
+    all_logit_results[[group]] <- group_results_clean
+    write_csv(group_results_clean, paste0("~/afib/outputs/proteomics/afib_cancer/cancer_control/logit_pcadj_", group, ".csv"))
+  }
+}
+
+# Combine
+combined_canceronly_pcadj_results <- bind_rows(all_logit_results)
+write_csv(combined_canceronly_pcadj_results, "~/afib/outputs/proteomics/afib_cancer/cancer_control/logit_combined.csv")
+
+
+
+# Sample sizes
+sample_n_df <- df_pc %>%
+  filter(cancer_status == 1) %>%
+  group_by(group = icd_group, afib_status) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = afib_status, values_from = n, values_fill = 0) %>%
+  rename(n_no_afib = `0`, n_afib = `1`) %>%
+  mutate(n_total = n_no_afib + n_afib) %>%
+  bind_rows(
+    df_pc %>%
+      filter(cancer_status == 1) %>%
+      summarise(n_no_afib = sum(afib_status == 0),
+                n_afib = sum(afib_status == 1)) %>%
+      mutate(group = "pan_cancer", n_total = n_no_afib + n_afib)
+  )
+
+# Plot
+groups <- unique(combined_canceronly_pcadj_results$Group)
+
+for (grp in groups) {
+  message("Plotting: ", grp)
+  
+  n_afib <- sample_n_df$n_afib[sample_n_df$group == grp]
+  n_cancer_only <- sample_n_df$n_no_afib[sample_n_df$group == grp]
+  
+  volcano_df <- combined_canceronly_pcadj_results %>%
+    filter(Group == grp) %>%
+    mutate(
+      neg_log_p = -log10(P_adj),
+      direction = case_when(
+        P_adj >= 0.05 ~ "Neutral",
+        Log_OR > 0 ~ "Up (Risk ↑)",
+        Log_OR < 0 ~ "Down (Protective)"
+      ),
+      label = ifelse(P_adj < 0.05 & abs(Log_OR) > 0.25, protein, NA)
+    )
+  
+  # Plot
+  p <- ggplot(volcano_df, aes(x = Log_OR, y = neg_log_p, color = direction)) +
+    geom_point(alpha = 0.9, size = 1.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkred") +
+    geom_text_repel(aes(label = label), size = 4, max.overlaps = 25) +
+    scale_color_manual(
+      values = c(
+        "Up (Risk ↑)" = "#D55E00",
+        "Down (Protective)" = "#0072B2",
+        "Neutral" = "grey70"
+      )
+    ) +
+    labs(
+      title = paste("AFib +", grp, "vs", grp, "Only"),
+      subtitle = paste0("n = ", n_afib, " with AFib, n = ", n_cancer_only, " cancer-only"),
+      x = "log(Odds Ratio)",
+      y = expression(-log[10]~"(FDR-Adjusted P-Value)"),
+      color = "Direction"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    coord_cartesian(ylim = c(0, 20))
+
+  print(p)
+}
+
+
+```
+
+
+
+### mono_cancer
+```{r}
+covariates <- c("age", "sex", paste0("PC", 1:10), "ethnicity")
+cov_str <- paste(covariates, collapse = " + ")
+
+# 7 selected groups (from your cleaned icd_group column)
+cancer_groups <- c("prostate", "breast", "colorectal", "lung", "bladder", "esophagus", "nhl")
+
+# Protein variables
+protein_vars <- setdiff(names(olink_df), "eid")
+cov_str <- paste(c("age", "sex", paste0("PC", 1:10), "ethnicity"), collapse = " + ")
+
+# Store results
+all_results <- list()
+
+# First: Pan-cancer (all cancer patients)
+message("Running pan-cancer AFib model")
+
+
+pan_results <- map_dfr(protein_vars, function(prot) {
+  formula_str <- paste0("cancer_status ~ ", prot, " + ", cov_str)
+  tryCatch({
+    fit <- glm(as.formula(formula_str), data = working_df, family = binomial)
+    tidy(fit) %>%
+      filter(term == prot) %>%
+      mutate(protein = prot)
+  }, error = function(e) NULL)
+})
+
+
+pan_clean <- pan_results %>%
+  select(term, estimate, std.error, statistic, p.value, protein) %>%
+  rename(Log_OR = estimate, SE = std.error, Z = statistic, P = p.value) %>%
+  mutate(
+    OR = exp(Log_OR),
+    CI_Lower = exp(Log_OR - 1.96 * SE),
+    CI_Upper = exp(Log_OR + 1.96 * SE),
+    Group = "pan_cancer",
+    P_adj = p.adjust(P, method = "fdr")
+  )
+
+all_results[["pan_cancer"]] <- pan_clean
+write_csv(pan_clean, "~/afib/outputs/proteomics/mono_cancer/logit_pancancer.csv")
+
+
+# Now loop through each cancer group
+for (group in cancer_groups) {
+  message("Analyzing cancer group: ", group)
+
+  group_df <- working_df %>%
+    filter(icd_group == group | cancer_status == 0) %>%
+    mutate(
+      cancer_label = if_else(icd_group == group, 1, 0)
+    )
+
+  n_case <- sum(group_df$cancer_label == 1)
+  n_control <- sum(group_df$cancer_label == 0)
+
+  if (n_case < 10 | n_control < 10) {
+    message("  Skipping due to small group sizes: n_case = ", n_case, ", n_control = ", n_control)
+    next
+  }
+
+  group_results <- map_dfr(protein_vars, function(prot) {
+    formula_str <- paste0("cancer_label ~ ", prot, " + ", cov_str)
+    tryCatch({
+      fit <- glm(as.formula(formula_str), data = group_df, family = binomial)
+      tidy(fit) %>%
+        filter(term == prot) %>%
+        mutate(protein = prot)
+    }, error = function(e) NULL)
+  })
+
+  group_clean <- group_results %>%
+    select(term, estimate, std.error, statistic, p.value, protein) %>%
+    rename(Log_OR = estimate, SE = std.error, Z = statistic, P = p.value) %>%
+    mutate(
+      OR = exp(Log_OR),
+      CI_Lower = exp(Log_OR - 1.96 * SE),
+      CI_Upper = exp(Log_OR + 1.96 * SE),
+      Group = group,
+      P_adj = p.adjust(P, method = "fdr"),
+    )
+
+  all_results[[group]] <- group_clean
+  write_csv(group_clean, paste0("~/afib/outputs/proteomics/mono_cancer/logit_", group, ".csv"))
+}
+
+# Combine all results
+combined_results <- bind_rows(all_results)
+write_csv(combined_results, "~/afib/outputs/proteomics/mono_cancer/logit_combined.csv")
+
+
+# Sample size table for each cancer group
+sample_n_df <- working_df %>%
+  filter(icd_group %in% cancer_groups | cancer_status == 0) %>%
+  mutate(group = if_else(cancer_status == 1, icd_group, "no_cancer")) %>%
+  group_by(group) %>%
+  summarise(
+    n_cancer = sum(cancer_status == 1 & icd_group == group),
+    n_control = sum(cancer_status == 0),
+    n_total = n_cancer + n_control,
+    .groups = "drop"
+  ) %>%
+  # Add total pan-cancer row
+  bind_rows(
+    working_df %>%
+      filter(cancer_status %in% c(0, 1)) %>%
+      summarise(
+        group = "pan_cancer",
+        n_cancer = sum(cancer_status == 1),
+        n_control = sum(cancer_status == 0),
+        n_total = n_cancer + n_control
+      )
+  )
+
+# Plotting
+groups <- unique(combined_results$Group)
+
+pdf("~/afib/outputs/proteomics/mono_cancer/mono_cancer_plots.pdf")
+
+for (grp in groups) {
+  message("Plotting: ", grp)
+  #plot pdf
+  
+  n_cancer <- sample_n_df$n_cancer[sample_n_df$group == grp]
+  n_control <- sample_n_df$n_control[sample_n_df$group=="no_cancer"]
+
+  volcano_df <- combined_results %>%
+    filter(Group == grp) %>%
+    mutate(
+      neg_log_p = -log10(P_adj),
+      direction = case_when(
+        P_adj >= 0.05 ~ "Neutral",
+        Log_OR > 0 ~ "Up (Risk ↑)",
+        Log_OR < 0 ~ "Down (Protective)"
+      ),
+      label = ifelse(P_adj < 0.05 & abs(Log_OR) > 0.25, protein, NA)
+    )
+
+  # Plot
+  p <- ggplot(volcano_df, aes(x = Log_OR, y = neg_log_p, color = direction)) +
+    geom_point(alpha = 0.9, size = 1.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkred") +
+    geom_text_repel(aes(label = label), size = 4, max.overlaps = 25) +
+    scale_color_manual(
+      values = c(
+        "Up (Risk ↑)" = "#D55E00",
+        "Down (Protective)" = "#0072B2",
+        "Neutral" = "grey70"
+      )
+    ) +
+    labs(
+      title = paste("AFib +", grp, "vs", grp, "Only"),
+      subtitle = paste0("n = ", n_cancer, " cancer, n = ", n_control, " no cancer"),
+      x = "log(Odds Ratio)",
+      y = expression(-log[10]~"(FDR-Adjusted P-Value)"),
+      color = "Direction"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    coord_cartesian(ylim = c(0, 20))
+
+  print(p)
+}
+dev.off()
+
+```
+
+### Add in columns for proteins found in the mono studies
+```{r}
+
+afib_control <- read_csv("~/afib/outputs/proteomics/afib_cancer/afib_control/logit_combined.csv")
+cancer_control <- read_csv("~/afib/outputs/proteomics/afib_cancer/cancer_control/logit_combined.csv")
+
+mono_afib <- read_csv("~/afib/outputs/proteomics/mono_afib/cox_results.csv")
+mono_cancer <- read_csv("~/afib/outputs/proteomics/mono_cancer/logit_combined.csv")
+
+
+# Extract list of proteins from mono_afib
+mono_afib_proteins <- mono_afib %>%
+  filter(P_adj <= 0.05) %>%
+  pull(Protein) %>%
+  unique()
+
+
+# Add in_mono_afib column to both datasets
+afib_control <- afib_control %>%
+  mutate(sig_in_mono_afib = protein %in% mono_afib_proteins)
+
+cancer_control <- cancer_control %>%
+  mutate(sig_in_mono_afib = protein %in% mono_afib_proteins)
+
+
+
+# do the same for mono_cancer proteins
+
+# Initialize columns
+afib_control$sig_in_mono_cancer <- FALSE
+cancer_control$sig_in_mono_cancer <- FALSE
+
+# Loop through cancer groups
+cancer_groups <- unique(mono_cancer$Group)
+
+for (grp in cancer_groups) {
+  # Get significant proteins for this group
+  sig_prots <- mono_cancer %>%
+    filter(Group == grp, P_adj <= 0.05) %>%
+    pull(protein) %>%
+    unique()
+  
+  # Flag in afib_control
+  afib_control <- afib_control %>%
+    mutate(sig_in_mono_cancer = if_else(
+      Group == grp & protein %in% sig_prots,
+      TRUE,
+      sig_in_mono_cancer
+    ))
+  
+  # Flag in cancer_control
+  cancer_control <- cancer_control %>%
+    mutate(sig_in_mono_cancer = if_else(
+      Group == grp & protein %in% sig_prots,
+      TRUE,
+      sig_in_mono_cancer
+    ))
+}
+
+
+write_csv(afib_control, "~/afib/outputs/proteomics/afib_cancer/afib_control/logit_combined_hits.csv")
+write_csv(cancer_control, "~/afib/outputs/proteomics/afib_cancer/cancer_control/logit_combined_hits.csv")
+
+
+```
+
+
+### 5-cancer grouping
+```{r}
+# Define ICD code prefixes for the 5 high-risk cancers
+high_risk_prefixes <- c("C15", "C16", "C34", "C90", "C81", "C82", "C83", "C84", "C85", "C86", "C88")
+
+# Create binary column: TRUE if any ICD matches a high-risk prefix
+working_df <- working_df %>%
+  mutate(
+    high_afib_risk_cancer = str_sub(cancer_icd, 1, 3) %in% high_risk_prefixes
+  )
+
+# Filter out no cancer
+df_sub <- working_df %>%
+  filter(cancer_status == 0 | high_afib_risk_cancer == TRUE)
+
+
+# mono cancer logistic regression
+
+# Covariates
+covariates <- c("age", "sex", paste0("PC", 1:10), "ethnicity")
+cov_str <- paste(covariates, collapse = " + ")
+
+# Define protein variables (omit eid)
+protein_vars <- setdiff(names(olink_df), "eid")
+
+
+# Logistic regression
+highrisk_results <- map_dfr(protein_vars, function(prot) {
+  formula_str <- paste0("high_afib_risk_cancer ~ ", prot, " + ", cov_str)
+  
+  tryCatch({
+    fit <- glm(as.formula(formula_str), data = df_sub, family = binomial)
+    
+    tidy(fit) %>%
+      filter(term == prot) %>%
+      mutate(protein = prot)
+  }, error = function(e) NULL)
+})
+
+# Clean + save
+highrisk_clean <- highrisk_results %>%
+  select(term, estimate, std.error, statistic, p.value, protein) %>%
+  rename(Log_OR = estimate, SE = std.error, Z = statistic, P = p.value) %>%
+  mutate(
+    OR = exp(Log_OR),
+    CI_Lower = exp(Log_OR - 1.96 * SE),
+    CI_Upper = exp(Log_OR + 1.96 * SE),
+    Group = "high_afib_risk_cancer",
+    P_adj = p.adjust(P, method = "fdr")
+  )
+
+write_csv(
+  highrisk_clean,
+  "~/afib/outputs/proteomics/mono_cancer/5cancer_group/logit.csv"
+)
+
+# Sample sizes
+sample_n_df <- working_df %>%
+  filter(
+    high_afib_risk_cancer == TRUE | cancer_status == 0
+  ) %>%
+  count(group = high_afib_risk_cancer) %>%
+  mutate(
+    label = if_else(group, "High-AFib-Risk Cancer", "No Cancer")
+  )
+
+# Extract n's
+n_cancer <- sample_n_df$n[sample_n_df$group == TRUE]
+n_control <- sample_n_df$n[sample_n_df$group == FALSE]
+
+# Prep data
+volcano_df <- highrisk_clean %>%
+  mutate(
+    neg_log_p = -log10(P_adj),
+    direction = case_when(
+      P_adj >= 0.05 ~ "Neutral",
+      Log_OR > 0 ~ "Up (↑ in High-Risk Cancer)",
+      Log_OR < 0 ~ "Down (↓ in High-Risk Cancer)"
+    ),
+    label = ifelse(P_adj < 0.05 & abs(Log_OR) > 0.25, protein, NA)
+  )
+
+# Plot
+p1 <- ggplot(volcano_df, aes(x = Log_OR, y = neg_log_p, color = direction)) +
+  geom_point(alpha = 0.9, size = 1.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkred") +
+  geom_text_repel(aes(label = label), size = 4, max.overlaps = 25) +
+  scale_color_manual(
+    values = c(
+      "Up (↑ in High-Risk Cancer)" = "#D55E00",
+      "Down (↓ in High-Risk Cancer)" = "#0072B2",
+      "Neutral" = "grey70"
+    )
+  ) +
+  labs(
+    title = "High AFib-Risk Cancer vs No Cancer",
+    subtitle = paste0("n = ", n_cancer, " with cancer, n = ", n_control, " without cancer"),
+    x = "log(Odds Ratio)",
+    y = expression(-log[10]~"(FDR-Adjusted P-Value)"),
+    color = "Direction"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  coord_cartesian(ylim = c(0, 20))  # adjust y-limit as needed
+
+print(p1)
+
+
+# Subset to AFib-only participants
+afib_only_df <- df_sub %>% filter(afib_status == 1)
+
+# Logistic regression loop: outcome = high_afib_risk_cancer
+afib_control_results <- map_dfr(protein_vars, function(prot) {
+  formula_str <- paste0("high_afib_risk_cancer ~ ", prot, " + ", cov_str)
+  tryCatch({
+    fit <- glm(as.formula(formula_str), data = afib_only_df, family = binomial)
+    broom::tidy(fit) %>%
+      filter(term == prot) %>%
+      mutate(protein = prot)
+  }, error = function(e) NULL)
+})
+
+# Clean up and annotate
+afib_control_clean <- afib_control_results %>%
+  select(term, estimate, std.error, statistic, p.value, protein) %>%
+  rename(Log_OR = estimate, SE = std.error, Z = statistic, P = p.value) %>%
+  mutate(
+    OR = exp(Log_OR),
+    CI_Lower = exp(Log_OR - 1.96 * SE),
+    CI_Upper = exp(Log_OR + 1.96 * SE),
+    Group = "highrisk_cancer",
+    P_adj = p.adjust(P, method = "fdr")
+  )
+
+# Save the table
+readr::write_csv(afib_control_clean, "~/afib/outputs/proteomics/afib_cancer/afib_control/5cancer_group/logit.csv")
+
+
+# Sample sizes for subtitle
+sample_n_df <- afib_only_df %>%
+  filter(!is.na(high_afib_risk_cancer)) %>%
+  count(group = high_afib_risk_cancer) %>%
+  mutate(
+    label = if_else(group, "High-AFib-Risk Cancer", "AFib Only")
+  )
+
+n_cancer <- sample_n_df$n[sample_n_df$group == TRUE]
+n_afib_only <- sample_n_df$n[sample_n_df$group == FALSE]
+
+volcano_df <- afib_control_clean %>%
+  mutate(
+    neg_log_p = -log10(P_adj),
+    direction = case_when(
+      P_adj >= 0.05 ~ "Neutral",
+      Log_OR > 0 ~ "Up (↑ in High-Risk Cancer)",
+      Log_OR < 0 ~ "Down (↓ in High-Risk Cancer)"
+    ),
+    label = ifelse(P_adj < 0.05 & abs(Log_OR) > 0.25, protein, NA)
+  )
+
+
+
+p2 <- ggplot(volcano_df, aes(x = Log_OR, y = neg_log_p, color = direction)) +
+  geom_point(alpha = 0.9, size = 1.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkred") +
+  geom_text_repel(aes(label = label), size = 4, max.overlaps = 25) +
+  scale_color_manual(
+    values = c(
+      "Up (↑ in High-Risk Cancer)" = "#D55E00",
+      "Down (↓ in High-Risk Cancer)" = "#0072B2",
+      "Neutral" = "grey70"
+    )
+  ) +
+  labs(
+    title = "AFib + High-Risk Cancer vs AFib Only",
+    subtitle = paste0("n = ", n_cancer, " with high-risk cancer, n = ", n_afib_only, " AFib-only"),
+    x = "log(Odds Ratio)",
+    y = expression(-log[10]~"(FDR-Adjusted P-Value)"),
+    color = "Direction"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  coord_cartesian(ylim = c(0, 20))  # Adjust as needed
+
+print(p2)
+
+
+
+# Subset to those with cancer
+cancer_only_df <- working_df %>%
+  filter(high_afib_risk_cancer == TRUE)
+
+
+# Run logistic regression: outcome = afib_status
+cancer_control_results <- map_dfr(protein_vars, function(prot) {
+  formula_str <- paste0("afib_status ~ ", prot, " + ", cov_str)
+  tryCatch({
+    fit <- glm(as.formula(formula_str), data = cancer_only_df, family = binomial)
+    broom::tidy(fit) %>%
+      filter(term == prot) %>%
+      mutate(protein = prot)
+  }, error = function(e) NULL)
+})
+
+# Clean and format
+cancer_control_clean <- cancer_control_results %>%
+  select(term, estimate, std.error, statistic, p.value, protein) %>%
+  rename(Log_OR = estimate, SE = std.error, Z = statistic, P = p.value) %>%
+  mutate(
+    OR = exp(Log_OR),
+    CI_Lower = exp(Log_OR - 1.96 * SE),
+    CI_Upper = exp(Log_OR + 1.96 * SE),
+    Group = "highrisk_cancer",
+    P_adj = p.adjust(P, method = "fdr")
+  )
+
+# Save
+readr::write_csv(cancer_control_clean, "~/afib/outputs/proteomics/afib_cancer/cancer_control/5cancer_group/logit.csv")
+
+
+
+# n's for cancer population: AFib vs No AFib
+sample_n_df <- cancer_only_df %>%
+  count(group = afib_status) %>%
+  mutate(
+    label = if_else(group == 1, "AFib+", "Cancer-only")
+  )
+
+n_afib <- sample_n_df$n[sample_n_df$group == 1]
+n_cancer_only <- sample_n_df$n[sample_n_df$group == 0]
+
+
+# Prepare volcano dataframe
+volcano_df <- cancer_control_clean %>%
+  mutate(
+    neg_log_p = -log10(P_adj),
+    direction = case_when(
+      P_adj >= 0.05 ~ "Neutral",
+      Log_OR > 0 ~ "Up (↑ in AFib + Cancer)",
+      Log_OR < 0 ~ "Down (↓ in AFib + Cancer)"
+    ),
+    label = ifelse(P_adj < 0.05 & abs(Log_OR) > 0.25, protein, NA)
+  )
+
+
+p3 <- ggplot(volcano_df, aes(x = Log_OR, y = neg_log_p, color = direction)) +
+  geom_point(alpha = 0.9, size = 1.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkred") +
+  geom_text_repel(aes(label = label), size = 4, max.overlaps = 25) +
+  scale_color_manual(
+    values = c(
+      "Up (↑ in AFib + Cancer)" = "#D55E00",
+      "Down (↓ in AFib + Cancer)" = "#0072B2",
+      "Neutral" = "grey70"
+    )
+  ) +
+  labs(
+    title = "AFib + Cancer vs Cancer Only",
+    subtitle = paste0("n = ", n_afib, " with AFib, n = ", n_cancer_only, " cancer-only"),
+    x = "log(Odds Ratio)",
+    y = expression(-log[10]~"(FDR-Adjusted P-Value)"),
+    color = "Direction"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  coord_cartesian(ylim = c(0, 20))  # adjust if needed
+
+print(p3)
+
+
+
+# Add in the columns
+mono_afib <- read_csv("~/afib/outputs/proteomics/mono_afib/cox_results.csv")
+
+afib_control <- afib_control_clean
+cancer_control <- cancer_control_clean
+
+# Filter significant mono-AFib proteins
+mono_afib_proteins <- mono_afib %>%
+  filter(P_adj <= 0.05) %>%
+  pull(Protein) %>%
+  unique()
+
+# Add sig_in_mono_afib flag
+afib_control <- afib_control %>%
+  mutate(sig_in_mono_afib = protein %in% mono_afib_proteins)
+
+cancer_control <- cancer_control %>%
+  mutate(sig_in_mono_afib = protein %in% mono_afib_proteins)
+
+
+
+# Get sig mono-cancer proteins by group
+sig_mono_cancer_prots <- highrisk_clean %>%
+  filter(P_adj <= 0.05) %>%
+  select(Group, protein) %>%
+  mutate(sig_in_mono_cancer = TRUE)
+
+# Add to afib_control
+afib_control <- afib_control %>%
+  left_join(sig_mono_cancer_prots, by = c("Group", "protein")) %>%
+  mutate(sig_in_mono_cancer = replace_na(sig_in_mono_cancer, FALSE))
+
+# Add to cancer_control
+cancer_control <- cancer_control %>%
+  left_join(sig_mono_cancer_prots, by = c("Group", "protein")) %>%
+  mutate(sig_in_mono_cancer = replace_na(sig_in_mono_cancer, FALSE))
+
+readr::write_csv(afib_control, "~/afib/outputs/proteomics/afib_cancer/afib_control/5cancer_group/logit.csv")
+readr::write_csv(cancer_control, "~/afib/outputs/proteomics/afib_cancer/cancer_control/5cancer_group/logit.csv")
+
+
+
+```
+
+### Forest plots for manuscript figure
+```{r}
+# Load results
+lung <- read_csv("~/afib/outputs/proteomics/afib_cancer/afib_control/logit_lung.csv") %>%
+  mutate(Stratum = "AF+Lung")
+nhl <- read_csv("~/afib/outputs/proteomics/afib_cancer/afib_control/logit_nhl.csv") %>%
+  mutate(Stratum = "AF+NHL")
+pancancer <- read_csv("~/afib/outputs/proteomics/afib_cancer/afib_control/logit_pancancer.csv") %>%
+  mutate(Stratum = "AF+Pan-Cancer")
+
+# Combine and filter to four proteins
+target_proteins <- c("cd200r1", "duox2", "itgam", "clec5a")
+
+# Build forest_df with only relevant strata per protein
+forest_df <- bind_rows(
+  lung %>% filter(protein %in% c("cd200r1", "duox2")) %>%
+    mutate(Stratum = "AF+Lung"),
+  nhl %>% filter(protein %in% c("itgam", "clec5a")) %>%
+    mutate(Stratum = "AF+NHL"),
+  pancancer %>% filter(protein %in% c("cd200r1", "duox2", "itgam", "clec5a")) %>%
+    mutate(Stratum = "AF+Pan-Cancer")
+) %>%
+  select(protein, Stratum, OR, CI_Lower, CI_Upper, P_adj) %>%
+  mutate(
+    protein = factor(protein,
+      levels = c("cd200r1", "duox2", "itgam", "clec5a"),
+      labels = c("CD200R1", "DUOX2", "ITGAM", "CLEC5A")
+    ),
+    Stratum = factor(Stratum, levels = c("AF+Lung", "AF+NHL", "AF+Pan-Cancer")),
+    Direction = case_when(
+      CI_Lower > 1 ~ "Positive",
+      CI_Upper < 1 ~ "Inverse",
+      TRUE ~ "Non-significant"
+    )
+  )
+
+# Plot
+ggplot(forest_df, aes(x = OR, y = Stratum, color = Direction)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_pointrange(
+    aes(xmin = CI_Lower, xmax = CI_Upper),
+    size = 0.8,
+    fatten = 3
+  ) +
+  scale_color_manual(values = c(
+    "Positive" = "#D55E00",
+    "Inverse" = "#0072B2",
+    "Non-significant" = "grey60"
+  )) +
+  facet_wrap(~ protein, ncol = 2, scales = "free_y") +
+  labs(
+    x = "Odds Ratio (95% CI)",
+    y = NULL,
+    color = "Direction of Association"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 12),
+    axis.text.y = element_text(size = 11)
+  )
+
+
+# Save as TIFF (most universally accepted)
+ggsave(
+  "~/afib/outputs/proteomics/afib_cancer/afib_control/forest_plot.tiff",
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 600,
+  compression = "lzw"
+)
+
+ggsave(
+  "~/afib/outputs/proteomics/afib_cancer/afib_control/forest_plot.pdf",
+  width = 7,
+  height = 5,
+  units = "in"
+)
+
+ggsave(
+  "~/afib/outputs/proteomics/afib_cancer/afib_control/forest_plot.png",
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 600
+)
+```
+
+
